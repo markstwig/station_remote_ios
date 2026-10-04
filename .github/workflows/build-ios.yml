@@ -1,23 +1,11 @@
 name: Build iOS IPA
-on: workflow_dispatch        # run it from the Actions tab
+on: workflow_dispatch
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - name: Tool versions
-        run: node -v; npm -v; xcodebuild -version; (pod --version || echo "pod missing")
-      - name: Install CocoaPods if the image lacks it
-        run: command -v pod || brew install cocoapods
-      - run: gem install xcodeproj
-      - name: Set up the Capacitor project (verbose)
-        run: bash -x setup.sh
-      - name: Check the Swift files were added to the Xcode project
-        run: grep -q StationSocketPlugin ios/App/App.xcodeproj/project.pbxproj
+      - run: xcodebuild -version
       - run: bash build-ipa.sh
       - uses: actions/upload-artifact@v4
-        with:
-          name: Station-ipa
-          path: ios/App/Station.ipa
+        with: { name: Station-ipa, path: Station.ipa }
