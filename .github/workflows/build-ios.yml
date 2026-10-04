@@ -7,11 +7,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
+      - name: Tool versions
+        run: node -v; npm -v; xcodebuild -version; (pod --version || echo "pod missing")
+      - name: Install CocoaPods if the image lacks it
+        run: command -v pod || brew install cocoapods
       - run: gem install xcodeproj
-      - run: ./setup.sh
+      - name: Set up the Capacitor project (verbose)
+        run: bash -x setup.sh
       - name: Check the Swift files were added to the Xcode project
         run: grep -q StationSocketPlugin ios/App/App.xcodeproj/project.pbxproj
-      - run: ./build-ipa.sh
+      - run: bash build-ipa.sh
       - uses: actions/upload-artifact@v4
         with:
           name: Station-ipa
