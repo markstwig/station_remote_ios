@@ -1,0 +1,6 @@
+{
+  "appId": "com.local.stationremote",
+  "appName": "Station",
+  "webDir": "www",
+  "plugins": { "CapacitorHttp": { "enabled": true } }
+}
