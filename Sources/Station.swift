@@ -38,17 +38,30 @@ final class TrustAll: NSObject, URLSessionDelegate {
 
 @MainActor @Observable
 final class Station {
-    var host: String, deviceId: String, platform: String, controlCenter: Bool, hasToken: Bool
-    var status = "Starting…", lastError = ""
-    var online = false, playing = false, volume = 0.0, alice = "IDLE"
-    var title = "", subtitle = "", duration = 0.0, progress = 0.0, stamp = Date(), coverURL: URL?
+    var host: String
+    var deviceId: String
+    var platform: String
+    var controlCenter: Bool
+    var hasToken: Bool
+    var status = "Starting…"
+    var lastError = ""
+    var online = false
+    var playing = false
+    var volume = 0.0
+    var alice = "IDLE"
+    var title = ""
+    var subtitle = ""
+    var duration = 0.0
+    var progress = 0.0
+    var stamp = Date()
+    var coverURL: URL?
 
     @ObservationIgnored private var task: URLSessionWebSocketTask?
     @ObservationIgnored private var session: URLSession?
     @ObservationIgnored private var convToken = ""
     @ObservationIgnored private var gen = 0
     @ObservationIgnored private var lastVol = Date.distantPast
-    @ObservationIgnored let nowPlaying = NowPlaying()
+    let nowPlaying = NowPlaying()
 
     init() {
         let d = UserDefaults.standard
