@@ -8,13 +8,21 @@ struct StationApp: App {
     var body: some Scene {
         WindowGroup {
             TabView {
-                ControlsView().tabItem { Label("Controls", systemImage: "play.circle.fill") }
+                HomeView().tabItem { Label("Playing", systemImage: "play.circle.fill") }
+                CommandsView().tabItem { Label("Commands", systemImage: "magnifyingglass") }
+                LogView().tabItem { Label("Log", systemImage: "list.bullet.rectangle") }
                 SettingsView().tabItem { Label("Settings", systemImage: "gearshape.fill") }
             }
             .environment(station)
             .preferredColorScheme(.dark)
             .task { station.connect() }
-            .onChange(of: phase) { _, new in if new == .active && !station.online { station.connect() } }
+            .task { await station.monitor() }
+            .onChange(of: phase) { _, new in
+                guard new == .active else { return }
+                station.nowPlaying.claim()
+                if !station.online { station.connect() }
+                Task { await station.refreshReachability() }
+            }
         }
     }
 }

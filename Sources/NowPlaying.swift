@@ -4,20 +4,52 @@ import UIKit
 
 /// Makes the speaker show up in Control Center / on the lock screen and routes those controls to it.
 /// iOS only treats an app as "Now Playing" while it plays audio, so we loop silence.
+///
+/// If another app (or a call) takes over audio, iOS tells us via an interruption notification, and we
+/// yield: we neither grab audio back nor forward any pause/play that iOS generates around it to the
+/// speaker. A real pause from the lock screen / Control Center arrives with no interruption.
 @MainActor
 final class NowPlaying {
     private var player: AVAudioPlayer?
     private var wired = false
     private var artURL: URL?
     private var art: MPMediaItemArtwork?
+    private weak var station: Station?
+    private var yielded = false
+    private var interruptedAt = Date.distantPast
+    private var systemInitiated: Bool { yielded || Date().timeIntervalSince(interruptedAt) < 2 }
+
+    init() {
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] n in
+            let v = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            Task { @MainActor in self?.interruption(began: v == AVAudioSession.InterruptionType.began.rawValue) }
+        }
+        nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] n in
+            let v = n.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            Task { @MainActor in
+                if v == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue { self?.interruptedAt = Date() }
+            }
+        }
+    }
+
+    private func interruption(began: Bool) {
+        if began { yielded = true; interruptedAt = Date(); player = nil }
+        else { yielded = false; if let s = station { update(s) } }
+    }
+
+    /// The user acted on purpose (opened the app, pressed a control): take audio focus again.
+    func claim() { yielded = false }
 
     func update(_ s: Station) {
+        station = s
         guard s.controlCenter, s.online, s.playing || !s.title.isEmpty else { stop(); return }
+        if yielded { return }   // another app has audio focus; don't steal it back
         start(); wire(s)
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: s.title,
             MPMediaItemPropertyArtist: s.subtitle,
-            MPMediaItemPropertyAlbumTitle: "Yandex Station",
+            MPMediaItemPropertyAlbumTitle: s.current?.name ?? "Yandex Station",
             MPMediaItemPropertyPlaybackDuration: s.duration,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: s.progress,
             MPNowPlayingInfoPropertyPlaybackRate: s.playing ? 1.0 : 0.0,
@@ -29,6 +61,7 @@ final class NowPlaying {
     }
 
     func stop() {
+        yielded = false
         guard player != nil else { return }
         player?.stop(); player = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
@@ -45,19 +78,26 @@ final class NowPlaying {
         } catch { }
     }
 
+    /// Runs a lock-screen / Control Center command, unless iOS caused it by an audio interruption.
+    private func forward(_ s: Station?, _ action: @MainActor (Station) -> Void) async {
+        try? await Task.sleep(for: .milliseconds(400))   // the interruption notice can arrive after the command
+        guard let s, !systemInitiated else { return }
+        action(s)
+    }
+
     private func wire(_ s: Station) {
         guard !wired else { return }; wired = true
         let c = MPRemoteCommandCenter.shared()
-        c.playCommand.addTarget { [weak s] _ in Task { @MainActor in s?.play() }; return .success }
-        c.pauseCommand.addTarget { [weak s] _ in Task { @MainActor in s?.pause() }; return .success }
-        c.togglePlayPauseCommand.addTarget { [weak s] _ in
-            Task { @MainActor in if let s { s.playing ? s.pause() : s.play() } }; return .success }
-        c.nextTrackCommand.addTarget { [weak s] _ in Task { @MainActor in s?.next() }; return .success }
-        c.previousTrackCommand.addTarget { [weak s] _ in Task { @MainActor in s?.prev() }; return .success }
-        c.changePlaybackPositionCommand.addTarget { [weak s] e in
+        c.playCommand.addTarget { [weak self, weak s] _ in Task { @MainActor in await self?.forward(s) { $0.play() } }; return .success }
+        c.pauseCommand.addTarget { [weak self, weak s] _ in Task { @MainActor in await self?.forward(s) { $0.pause() } }; return .success }
+        c.togglePlayPauseCommand.addTarget { [weak self, weak s] _ in
+            Task { @MainActor in await self?.forward(s) { if $0.playing { $0.pause() } else { $0.play() } } }; return .success }
+        c.nextTrackCommand.addTarget { [weak self, weak s] _ in Task { @MainActor in await self?.forward(s) { $0.next() } }; return .success }
+        c.previousTrackCommand.addTarget { [weak self, weak s] _ in Task { @MainActor in await self?.forward(s) { $0.prev() } }; return .success }
+        c.changePlaybackPositionCommand.addTarget { [weak self, weak s] e in
             guard let e = e as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
             let t = e.positionTime
-            Task { @MainActor in s?.seek(t) }; return .success }
+            Task { @MainActor in await self?.forward(s) { $0.seek(t) } }; return .success }
     }
 
     private func loadArt(_ url: URL?, _ s: Station) {
@@ -75,7 +115,7 @@ final class NowPlaying {
         MPMediaItemArtwork(boundsSize: img.size) { _ in img }
     }
 
-    /// One second of 8 kHz mono 16-bit silence as a WAV file.
+    /// Two seconds of 8 kHz mono 16-bit silence as a WAV file.
     nonisolated static func silence() -> Data {
         let rate: UInt32 = 8000, n = rate * 2
         var d = Data()
