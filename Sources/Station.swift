@@ -17,6 +17,7 @@ struct Speaker: Codable, Identifiable, Hashable {
     var account: String
     var raw: String = ""    // device record from Yandex, pretty-printed
 }
+struct SavedSong: Codable, Identifiable { var id = UUID(); var title: String; var artist: String; var cover: String?; var date: Date; var trackID: String? }
 struct Track: Identifiable { let id: String; let title: String; let artist: String; let cover: URL?; let duration: Double }
 struct LogLine: Identifiable { let id = UUID(); let date = Date(); let out: Bool; let text: String }
 
@@ -103,6 +104,10 @@ final class Station {
     var log: [LogLine] = []
     var logPaused = false
     var results: [Track] = []
+    var saved: [SavedSong] = []
+    var trackID = ""
+    var liked: Set<String> = []
+    var notice: String?
     var searching = false
 
     @ObservationIgnored private var task: URLSessionWebSocketTask?
@@ -110,6 +115,7 @@ final class Station {
     @ObservationIgnored private var convToken = ""
     @ObservationIgnored private var versionReq = ""
     @ObservationIgnored private var gen = 0
+    @ObservationIgnored private var uids: [String: String] = [:]
     @ObservationIgnored private var lastVol = Date.distantPast
     let nowPlaying = NowPlaying()
 
@@ -120,6 +126,7 @@ final class Station {
         let d = UserDefaults.standard
         if let x = d.data(forKey: "accounts"), let v = try? JSONDecoder().decode([Account].self, from: x) { accounts = v }
         if let x = d.data(forKey: "speakers"), let v = try? JSONDecoder().decode([Speaker].self, from: x) { speakers = v }
+        if let x = d.data(forKey: "saved"), let v = try? JSONDecoder().decode([SavedSong].self, from: x) { saved = v }
         selectedID = d.string(forKey: "sel") ?? ""
         controlCenter = d.object(forKey: "cc") as? Bool ?? true
     }
@@ -127,6 +134,7 @@ final class Station {
         let d = UserDefaults.standard
         d.set(try? JSONEncoder().encode(accounts), forKey: "accounts")
         d.set(try? JSONEncoder().encode(speakers), forKey: "speakers")
+        d.set(try? JSONEncoder().encode(saved), forKey: "saved")
         d.set(selectedID, forKey: "sel"); d.set(controlCenter, forKey: "cc")
     }
     var current: Speaker? { speakers.first { $0.id == selectedID } ?? speakers.first }
@@ -179,7 +187,7 @@ final class Station {
     }
     private func resetState() {
         playing = false; title = ""; subtitle = ""; duration = 0; progress = 0; coverURL = nil
-        stateJSON = ""; versionJSON = ""; alice = "IDLE"
+        stateJSON = ""; versionJSON = ""; alice = "IDLE"; trackID = ""
     }
 
     // MARK: availability (TCP-probes the saved IPs)
@@ -255,10 +263,9 @@ final class Station {
 
     private func addLog(_ out: Bool, _ s: String) {
         guard !logPaused else { return }
-        var t = convToken.isEmpty ? s : s.replacingOccurrences(of: convToken, with: "•••")
-        if t.count > 2000 { t = String(t.prefix(2000)) + "…" }
-        log.append(LogLine(out: out, text: t))
-        if log.count > 300 { log.removeFirst(log.count - 300) }
+        let t = convToken.isEmpty ? s : s.replacingOccurrences(of: convToken, with: "•••")
+        log.append(LogLine(out: out, text: t))      // stored in full
+        if log.count > 400 { log.removeFirst(log.count - 400) }
     }
 
     private func handle(_ m: URLSessionWebSocketTask.Message) {
@@ -273,6 +280,7 @@ final class Station {
         alice = st["aliceState"] as? String ?? "IDLE"
         let p = st["playerState"] as? [String: Any] ?? [:]
         title = p["title"] as? String ?? ""
+        trackID = (p["type"] as? String) == "Track" ? (p["id"] as? String ?? "") : ""
         subtitle = p["subtitle"] as? String ?? ""
         duration = p["duration"] as? Double ?? 0
         progress = p["progress"] as? Double ?? 0
@@ -314,14 +322,94 @@ final class Station {
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             guard code == 200 else { throw StationError("Search failed (HTTP \(code))") }
             let tracks = ((try JSONSerialization.jsonObject(with: data) as? [String: Any])?["result"] as? [String: Any])?["tracks"] as? [String: Any]
-            results = (tracks?["results"] as? [[String: Any]] ?? []).compactMap { t in
-                guard let id = (t["id"] as? String) ?? (t["id"] as? Int).map(String.init) else { return nil }
-                let artists = (t["artists"] as? [[String: Any]])?.compactMap { $0["name"] as? String }.joined(separator: ", ") ?? ""
-                let cover = (t["coverUri"] as? String).flatMap { URL(string: "https://" + $0.replacingOccurrences(of: "%%", with: "200x200")) }
-                return Track(id: id, title: t["title"] as? String ?? "", artist: artists, cover: cover,
-                             duration: (t["durationMs"] as? Double ?? 0) / 1000)
-            }
+            results = (tracks?["results"] as? [[String: Any]] ?? []).compactMap(Self.track)
             lastError = ""
         } catch { lastError = error.localizedDescription }
+    }
+
+    static func track(_ t: [String: Any]) -> Track? {
+        guard let id = (t["id"] as? String) ?? (t["id"] as? Int).map(String.init) else { return nil }
+        let artists = (t["artists"] as? [[String: Any]])?.compactMap { $0["name"] as? String }.joined(separator: ", ") ?? ""
+        let cover = (t["coverUri"] as? String).flatMap { URL(string: "https://" + $0.replacingOccurrences(of: "%%", with: "200x200")) }
+        return Track(id: id, title: t["title"] as? String ?? "", artist: artists, cover: cover,
+                     duration: (t["durationMs"] as? Double ?? 0) / 1000)
+    }
+
+    /// "My Wave" recommendations of one signed-in account, shown as a track list.
+    func loadWave(_ acc: Account) async {
+        guard let tok = Keychain.get(acc.id) else { lastError = "Sign in first."; return }
+        searching = true; defer { searching = false }
+        var r = URLRequest(url: URL(string: "https://api.music.yandex.net/rotor/station/user:onyourwave/tracks")!)
+        r.setValue("OAuth \(tok)", forHTTPHeaderField: "Authorization")
+        r.setValue("YandexMusicAndroid/24023231", forHTTPHeaderField: "X-Yandex-Music-Client")
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: r)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            guard code == 200 else { throw StationError("Recommendations failed (HTTP \(code))") }
+            let seq = ((try JSONSerialization.jsonObject(with: data) as? [String: Any])?["result"] as? [String: Any])?["sequence"] as? [[String: Any]] ?? []
+            results = seq.compactMap { ($0["track"] as? [String: Any]).flatMap(Self.track) }
+            lastError = results.isEmpty ? "No recommendations returned." : ""
+        } catch { lastError = error.localizedDescription }
+    }
+
+    // MARK: saved songs & Apple Music
+    var isSaved: Bool { saved.contains { $0.title == title && $0.artist == subtitle } }
+    func toggleSave() {
+        guard !title.isEmpty else { return }
+        if let i = saved.firstIndex(where: { $0.title == title && $0.artist == subtitle }) { saved.remove(at: i) }
+        else { saved.insert(SavedSong(title: title, artist: subtitle, cover: coverURL?.absoluteString, date: Date(),
+                               trackID: trackID.isEmpty ? nil : trackID), at: 0) }
+        persist()
+    }
+    func playSaved(_ song: SavedSong) {
+        if let id = song.trackID { nowPlaying.claim(); cmd(["command": "playMusic", "id": id, "type": "track"]) }
+        else { say("Включи \(song.artist) — \(song.title)") }
+    }
+
+    /// Likes (or un-likes) the playing track in the selected account's Yandex Music library.
+    func toggleLike() async {
+        guard !trackID.isEmpty, let sp = current, let tok = token(sp) else { return }
+        let id = trackID, remove = liked.contains(id)
+        func req(_ url: String, post: String? = nil) -> URLRequest {
+            var r = URLRequest(url: URL(string: url)!)
+            r.setValue("OAuth \(tok)", forHTTPHeaderField: "Authorization")
+            r.setValue("YandexMusicAndroid/24023231", forHTTPHeaderField: "X-Yandex-Music-Client")
+            if let b = post {
+                r.httpMethod = "POST"
+                r.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+                r.httpBody = Data(b.utf8)
+            }
+            return r
+        }
+        do {
+            var uid = uids[sp.account]
+            if uid == nil {
+                let (d, resp) = try await URLSession.shared.data(for: req("https://api.music.yandex.net/account/status"))
+                guard (resp as? HTTPURLResponse)?.statusCode == 200,
+                      let acc = ((try JSONSerialization.jsonObject(with: d) as? [String: Any])?["result"] as? [String: Any])?["account"] as? [String: Any],
+                      let u = (acc["uid"] as? Int).map(String.init) ?? (acc["uid"] as? String)
+                else { throw StationError("Couldn't read the Yandex Music account.") }
+                uids[sp.account] = u; uid = u
+            }
+            guard let uid else { return }
+            let action = remove ? "remove" : "add-multiple"
+            let (_, resp) = try await URLSession.shared.data(for: req("https://api.music.yandex.net/users/\(uid)/likes/tracks/\(action)", post: "track-ids=\(id)"))
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            guard code == 200 || code == 202 else { throw StationError("Yandex Music replied HTTP \(code).") }
+            if remove { liked.remove(id) } else { liked.insert(id) }
+        } catch { notice = error.localizedDescription }
+    }
+
+    /// Finds the song through Apple's public iTunes Search API; falls back to an Apple Music search page.
+    func appleMusicURL(_ title: String, _ artist: String) async -> URL {
+        let term = "\(title) \(artist)".trimmingCharacters(in: .whitespaces)
+        var c = URLComponents(string: "https://itunes.apple.com/search")!
+        c.queryItems = [.init(name: "term", value: term), .init(name: "entity", value: "song"), .init(name: "limit", value: "1")]
+        if let (data, _) = try? await URLSession.shared.data(from: c.url!),
+           let list = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["results"] as? [[String: Any]],
+           let u = list.first?["trackViewUrl"] as? String, let url = URL(string: u) { return url }
+        var f = URLComponents(string: "https://music.apple.com/search")!
+        f.queryItems = [.init(name: "term", value: term)]
+        return f.url!
     }
 }

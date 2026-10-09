@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import WebKit
 
 // MARK: Liquid Glass with a material fallback for older iOS / older Xcode
@@ -41,6 +42,7 @@ struct HomeView: View {
     @State private var scrub: Double?
     @State private var volDrag: Double?
     @State private var pickerOpen = false
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         GeometryReader { g in
@@ -61,6 +63,9 @@ struct HomeView: View {
         }
         .background { Backdrop(url: s.coverURL) }
         .overlay(alignment: .top) { SpeakerPicker(open: $pickerOpen).padding(.horizontal, 24).padding(.top, 6) }
+        .alert("Yandex Music", isPresented: Binding(get: { s.notice != nil }, set: { if !$0 { s.notice = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: { Text(s.notice ?? "") }
     }
 
     private func artwork(_ side: CGFloat) -> some View {
@@ -80,12 +85,28 @@ struct HomeView: View {
     }
 
     private var titleRow: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(s.title.isEmpty ? "Nothing playing" : s.title).font(.title3.weight(.semibold)).lineLimit(1)
-            Text(s.subtitle.isEmpty ? (s.online && s.alice != "IDLE" ? s.alice.capitalized : s.status) : s.subtitle)
-                .font(.title3).foregroundStyle(.secondary).lineLimit(1)
+        HStack(spacing: 2) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(s.title.isEmpty ? "Nothing playing" : s.title).font(.title3.weight(.semibold)).lineLimit(1)
+                Text(s.subtitle.isEmpty ? (s.online && s.alice != "IDLE" ? s.alice.capitalized : s.status) : s.subtitle)
+                    .font(.title3).foregroundStyle(.secondary).lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button { Task { await s.toggleLike() } } label: {
+                Image(systemName: s.liked.contains(s.trackID) ? "heart.fill" : "heart").font(.title3).frame(width: 36, height: 40)
+            }
+            .disabled(s.trackID.isEmpty)
+            .accessibilityLabel("Like on Yandex Music")
+            Button { s.toggleSave() } label: {
+                Image(systemName: s.isSaved ? "bookmark.fill" : "bookmark").font(.title3).frame(width: 36, height: 40)
+            }
+            .accessibilityLabel(s.isSaved ? "Remove from saved" : "Save for later")
+            Button { let t = s.title, a = s.subtitle; Task { openURL(await s.appleMusicURL(t, a)) } } label: {
+                Image(systemName: "arrow.up.forward.app").font(.title3).frame(width: 36, height: 40)
+            }
+            .accessibilityLabel("Open in Apple Music")
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .buttonStyle(.plain).disabled(s.title.isEmpty)
     }
 
     private var progressBar: some View {
@@ -194,6 +215,8 @@ struct CommandsView: View {
     @State private var text = ""
     @State private var ask = true
     @State private var query = ""
+    @State private var waveAcc = ""
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         NavigationStack {
@@ -207,6 +230,22 @@ struct CommandsView: View {
                         Button("Send", action: send).buttonStyle(.borderless)
                             .disabled(text.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
+                }
+                Section {
+                    HStack(spacing: 8) {
+                        Button { s.say("Включи мою волну") } label: { Label("My Wave", systemImage: "waveform").frame(maxWidth: .infinity) }
+                        Button { s.say("Включи моё любимое") } label: { Label("Favorites", systemImage: "heart").frame(maxWidth: .infinity) }
+                        Button { s.say("Включи музыку") } label: { Label("Any", systemImage: "music.note").frame(maxWidth: .infinity) }
+                    }
+                    .buttonStyle(.bordered).font(.footnote)
+                    if s.accounts.count > 0 {
+                        Picker("Recommendations of", selection: $waveAcc) { ForEach(s.accounts) { Text($0.label).tag($0.id) } }
+                        Button("Show this account's My Wave tracks") {
+                            if let a = s.accounts.first(where: { $0.id == waveAcc }) ?? s.accounts.first { Task { await s.loadWave(a) } }
+                        }
+                    }
+                } header: { Text("Recommended") } footer: {
+                    Text("The buttons ask Alice, who uses the Station's own profile. The Station tells voice profiles apart by listening, so a text command can't pick one. The track list uses the chosen account's own recommendations instead; tap a track to play it.")
                 }
                 Section("Play music") {
                     HStack {
@@ -231,9 +270,35 @@ struct CommandsView: View {
                         .contextMenu { Button("Play via Alice", systemImage: "waveform") { s.playViaAlice(t) } }
                     }
                 }
+                if !s.saved.isEmpty {
+                    Section("Saved for later") {
+                        ForEach(s.saved) { song in
+                            Button { s.playSaved(song) } label: {
+                                HStack(spacing: 12) {
+                                    AsyncImage(url: song.cover.flatMap { URL(string: $0) }) { $0.resizable().scaledToFill() } placeholder: { Color.gray.opacity(0.25) }
+                                        .frame(width: 44, height: 44).clipShape(RoundedRectangle(cornerRadius: 8))
+                                    VStack(alignment: .leading) {
+                                        Text(song.title).lineLimit(1)
+                                        Text(song.artist).font(.footnote).foregroundStyle(.secondary).lineLimit(1)
+                                    }
+                                    Spacer()
+                                }
+                            }
+                            .foregroundStyle(.primary)
+                            .contextMenu {
+                                Button("Play via Alice", systemImage: "waveform") { s.say("Включи \(song.artist) — \(song.title)") }
+                                Button("Open in Apple Music", systemImage: "arrow.up.forward.app") {
+                                    Task { openURL(await s.appleMusicURL(song.title, song.artist)) }
+                                }
+                            }
+                        }
+                        .onDelete { s.saved.remove(atOffsets: $0); s.persist() }
+                    }
+                }
                 if !s.lastError.isEmpty { Section { Text(s.lastError).font(.footnote).foregroundStyle(.red) } }
             }
             .navigationTitle("Commands")
+            .onAppear { if waveAcc.isEmpty { waveAcc = s.current?.account ?? s.accounts.first?.id ?? "" } }
         }
     }
 
@@ -254,39 +319,92 @@ struct CommandsView: View {
 struct LogView: View {
     @Environment(Station.self) private var s
     @State private var hideState = false
+    @State private var hidePings = false
+    @State private var compact = true
+    @State private var expandAll = false
+    @State private var filter = ""
 
-    private var shown: [LogLine] { hideState ? s.log.filter { !$0.text.contains("\"state\"") } : s.log }
+    private var shown: [LogLine] {
+        s.log.filter { l in
+            (!hideState || !l.text.contains("\"state\"")) &&
+            (!hidePings || !l.text.contains("\"command\":\"ping\"")) &&
+            (filter.isEmpty || l.text.localizedCaseInsensitiveContains(filter))
+        }
+    }
 
     var body: some View {
         NavigationStack {
             ScrollViewReader { proxy in
-                List(shown) { l in
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text(l.out ? "→ sent" : "← received")
-                            Text(l.date, format: .dateTime.hour().minute().second())
-                        }
-                        .font(.caption2).foregroundStyle(l.out ? Color.blue : Color.green)
-                        Text(l.text).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
-                    }
-                    .id(l.id)
-                }
-                .listStyle(.plain)
-                .onChange(of: s.log.count) { if let last = shown.last { proxy.scrollTo(last.id, anchor: .bottom) } }
+                List(shown) { l in LogRow(line: l, compact: compact, expandAll: expandAll) }
+                    .listStyle(.plain)
+                    .onChange(of: s.log.count) { if let last = shown.last { proxy.scrollTo(last.id, anchor: .bottom) } }
             }
-            .overlay { if s.log.isEmpty { Text("No messages yet").foregroundStyle(.secondary) } }
+            .overlay { if shown.isEmpty { Text(s.log.isEmpty ? "No messages yet" : "Nothing matches").foregroundStyle(.secondary) } }
+            .searchable(text: $filter, prompt: "Filter messages")
             .navigationTitle("Live log")
             .toolbar {
                 Menu {
+                    Toggle("Expand all", isOn: $expandAll)
+                    Toggle("Compact (hide ids & timestamps)", isOn: $compact)
                     Toggle("Hide state updates", isOn: $hideState)
+                    Toggle("Hide pings", isOn: $hidePings)
                     Button(s.logPaused ? "Resume" : "Pause", systemImage: s.logPaused ? "play" : "pause") { s.logPaused.toggle() }
                     ShareLink(item: s.log.map { ($0.out ? "> " : "< ") + $0.text }.joined(separator: "\n")) {
-                        Label("Export", systemImage: "square.and.arrow.up")
+                        Label("Export everything", systemImage: "square.and.arrow.up")
                     }
                     Button("Clear", systemImage: "trash", role: .destructive) { s.log.removeAll() }
                 } label: { Image(systemName: "ellipsis.circle") }
             }
         }
+    }
+}
+
+/// One log entry: a one-line summary that expands to the complete, pretty-printed message.
+private struct LogRow: View {
+    let line: LogLine
+    let compact: Bool
+    let expandAll: Bool
+    @State private var open = false
+    private var isOpen: Bool { open || expandAll }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: isOpen ? "chevron.down" : "chevron.right").font(.caption2).frame(width: 10)
+                Text(line.out ? "→" : "←")
+                Text(line.date, format: .dateTime.hour().minute().second())
+                Text(summary).lineLimit(1).foregroundStyle(.primary)
+                Spacer(minLength: 0)
+            }
+            .font(.caption.monospacedDigit()).foregroundStyle(line.out ? Color.blue : Color.green)
+            .contentShape(Rectangle()).onTapGesture { withAnimation(.snappy) { open.toggle() } }
+            if isOpen {
+                Text(detail).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+            }
+        }
+        .contextMenu { Button("Copy raw message", systemImage: "doc.on.doc") { UIPasteboard.general.string = line.text } }
+    }
+
+    private var json: Any? { try? JSONSerialization.jsonObject(with: Data(line.text.utf8)) }
+
+    private var summary: String {
+        guard let o = json as? [String: Any] else { return String(line.text.prefix(80)) }
+        if let p = o["payload"] as? [String: Any] {
+            let c = p["command"] as? String ?? "?"
+            let extra = (p["text"] as? String) ?? p["volume"].map { "\($0)" } ?? p["position"].map { "\($0)" } ?? (p["id"] as? String)
+            return extra.map { "\(c): \($0)" } ?? c
+        }
+        if let st = o["state"] as? [String: Any] {
+            let title = (st["playerState"] as? [String: Any])?["title"] as? String ?? ""
+            return "state · " + ((st["playing"] as? Bool) == true ? "playing" : "idle/paused") + (title.isEmpty ? "" : " · " + title)
+        }
+        return "reply · " + ((o["status"] as? String) ?? o.keys.sorted().prefix(4).joined(separator: ", "))
+    }
+
+    private var detail: String {
+        guard var o = json else { return line.text }
+        if compact, var d = o as? [String: Any] { for k in ["conversationToken", "sentTime", "id"] { d[k] = nil }; o = d }
+        return pretty(o)
     }
 }
 
